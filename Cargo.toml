@@ -6,11 +6,16 @@ rust-version = "1.98"
 description = "Index decompiled source into SQLite. Zero dependencies."
 
 # No [dependencies] section at all, and that is the point:
-#   - regex  : src/match.rs, hand-written; every class is ASCII by construction
-#   - rusqlite: src/db.rs, linked against winsqlite3.dll (ships with Win10 1809+)
+#   - regex  : src/rx.rs, hand-written; every class is ASCII by construction
+#   - rusqlite: src/db.rs, linked against the system SQLite (winsqlite3.dll on
+#     Windows 10 1809+, libsqlite3 elsewhere -- see the cfg_attr in db.rs)
 #   - clap   : src/cli.rs, hand-rolled
 #   - serde  : src/cli.rs, a 20-line JSON string escaper
 # Nothing to install, nothing to vendor, no build.rs.
+
+[lib]
+name = "gamedb"
+path = "src/lib.rs"
 
 [[bin]]
 name = "gamedb"

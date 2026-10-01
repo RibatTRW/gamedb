@@ -1,5 +1,6 @@
-//! argv, output formatting. No clap: the flag surface is small, fixed, and must
-//! match the Python build name for name so the two can be diffed directly.
+//! argv, output formatting. No clap: the flag surface is small, fixed, and is
+//! kept name-for-name identical to the reference implementations so the three
+//! can be diffed directly.
 
 use crate::db::Val;
 use crate::store::*;
@@ -10,15 +11,19 @@ pub const USAGE: &str = concat!(
     "  gamedb index    -r SRC [-v] [--dry-run] [--force]   incremental; -v N = progress every N\n",
     "  gamedb search   -r SRC QUERY [--limit N]             function-name substring\n",
     "  gamedb strings  -r SRC QUERY [--limit N]             string-literal substring\n",
-    "  gamedb read     -r SRC NAME [--out F] [--force]      function body, verbatim\n",
+    "  gamedb read     -r SRC NAME [--path SUBSTR] [--out F] [--force]   function body, verbatim\n",
     "  gamedb stats    -r SRC\n",
     "  gamedb modules  -r SRC\n",
     "  gamedb set-module -r SRC --module ID [--state S] [--verified|--unverified]\n",
     "                     [--verified-by WHO] [--remaining TEXT]\n",
-    "  gamedb graph    -r SRC NAME [--direction both|callers|callees]\n",
+    "  gamedb graph    -r SRC NAME [--path SUBSTR] [--direction both|callers|callees]\n",
     "  gamedb sql      -r SRC --sql Q [--param V]...        escape hatch: raw SQLite\n",
     "  gamedb selftest\n",
     "global: -r/--root SRC (default .)  --db PATH  --json  -q  -v  -h  -V\n",
+    "        --rules FILE|derive   module rules: a rule file, or `derive` to ignore\n",
+    "                              any rule file and bucket the corpus by path\n",
+    "                             (default: .gamedb/modules.txt if it exists, else derive)\n",
+    "        --path SUBSTR        disambiguate a name shared by several definitions\n",
     "state:  UNIMPLEMENTED | PARTIALLY_IMPLEMENTED | IMPLEMENTED\n"
 );
 
@@ -57,6 +62,10 @@ pub struct Args {
     pub remaining: Option<String>,
     pub sql: Option<String>,
     pub params: Vec<String>,
+    /// Substring of the owning file path, for names several files define.
+    pub path: Option<String>,
+    /// `derive`, or a path to a module-rule file.
+    pub rules: Option<String>,
     pub help: bool,
     pub version: bool,
 }
@@ -128,6 +137,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args, String> {
                 "--remaining" => a.remaining = Some(v),
                 "--sql" => a.sql = Some(v),
                 "--param" => a.params.push(v),
+                "--path" => a.path = Some(v),
+                "--rules" => a.rules = Some(v),
                 other => return Err(format!("unknown flag {:?}; try: gamedb --help", other)),
             }
             i += 1;
@@ -173,6 +184,8 @@ pub fn parse(argv: Vec<String>) -> Result<Args, String> {
             "--remaining" => a.remaining = Some(take(&rest, &mut i, &name)?),
             "--sql" => a.sql = Some(take(&rest, &mut i, &name)?),
             "--param" => a.params.push(take(&rest, &mut i, &name)?),
+            "--path" => a.path = Some(take(&rest, &mut i, &name)?),
+            "--rules" => a.rules = Some(take(&rest, &mut i, &name)?),
             other => return Err(format!("unknown flag {:?}; try: gamedb --help", other)),
         }
         i += 1;
@@ -246,8 +259,47 @@ pub fn run(a: Args) -> Result<i32, String> {
         "selftest" => Ok(crate::selftest::run()),
 
         "index" => {
-            let r = index_root(&root, db, a.verbose, a.dry_run, a.force)?;
+            let r = index_root(
+                &root,
+                db,
+                a.verbose,
+                a.dry_run,
+                a.force,
+                a.rules.as_deref().unwrap_or(""),
+            )?;
             let verb = if a.dry_run { "dry-run" } else { "indexed" };
+            // A count of failures with no path in it reads as "a few bad files,
+            // don't worry" and is indistinguishable from success. Name them.
+            let mut lines = vec![format!(
+                "{} files={} fn={} str={} sym={} edges={} skipped={} failed={} {:.2}s",
+                verb,
+                r.files,
+                r.functions,
+                r.strings,
+                r.symbols,
+                r.edges,
+                r.skipped,
+                r.failed.total,
+                r.seconds
+            )];
+            for p in &r.failed.items {
+                lines.push(format!("  unreadable: {}", p));
+            }
+            if r.failed.total as usize > r.failed.items.len() {
+                lines.push(format!(
+                    "  ... and {} more unreadable",
+                    r.failed.total as usize - r.failed.items.len()
+                ));
+            }
+            for p in &r.decoded.items {
+                lines.push(format!("  lossy-decode: {}", p));
+            }
+            if r.decoded.total as usize > r.decoded.items.len() {
+                lines.push(format!(
+                    "  ... and {} more lossy decodes",
+                    r.decoded.total as usize - r.decoded.items.len()
+                ));
+            }
             emit(
                 &a,
                 obj(vec![
@@ -257,21 +309,12 @@ pub fn run(a: Args) -> Result<i32, String> {
                     ("symbols", r.symbols.to_string()),
                     ("edges", r.edges.to_string()),
                     ("skipped", r.skipped.to_string()),
-                    ("failed", r.failed.to_string()),
+                    ("failed", r.failed.total.to_string()),
+                    ("lossy_decodes", r.decoded.total.to_string()),
+                    ("module_rules", jstr(&r.rules)),
                     ("seconds", format!("{:.2}", r.seconds)),
                 ]),
-                vec![format!(
-                    "{} files={} fn={} str={} sym={} edges={} skipped={} failed={} {:.2}s",
-                    verb,
-                    r.files,
-                    r.functions,
-                    r.strings,
-                    r.symbols,
-                    r.edges,
-                    r.skipped,
-                    r.failed,
-                    r.seconds
-                )],
+                lines,
             );
             Ok(0)
         }
@@ -375,12 +418,24 @@ pub fn run(a: Args) -> Result<i32, String> {
                 .pos
                 .first()
                 .ok_or_else(|| "read needs a NAME".to_string())?;
-            let found = read_function(&root, db, name)?;
-            let Some((sig, path, body)) = found else {
+            let found = read_function(&root, db, name, a.path.as_deref())?;
+            let Some((sig, path, body, candidates)) = found else {
                 return Err(format!(
                     "function \"{}\" not indexed - try: gamedb search -r {} {}",
                     name, a.root, name
                 ));
+            };
+            // Overloads, partial classes and decompiler FUN_ names repeat. Say how
+            // many definitions matched, and which one came back, so a wrong body
+            // is visible instead of merely surprising.
+            let ambiguous = candidates > 1;
+            let note = if ambiguous {
+                format!(
+                    "note: {} definitions match \"{}\"; showing {} - narrow with --path SUBSTR",
+                    candidates, name, path
+                )
+            } else {
+                String::new()
             };
             match &a.out {
                 Some(p) => {
@@ -395,31 +450,44 @@ pub fn run(a: Args) -> Result<i32, String> {
                             ("sig", jstr(&sig)),
                             ("path", jstr(&path)),
                             ("out", jstr(p)),
+                            ("candidates", candidates.to_string()),
                             ("lines", (body.matches('\n').count() + 1).to_string()),
                         ]),
-                        vec![format!(
-                            "wrote {} ({} lines) from {}",
-                            p,
-                            body.matches('\n').count() + 1,
-                            path
-                        )],
+                        vec![note]
+                            .into_iter()
+                            .filter(|s| !s.is_empty())
+                            .chain(std::iter::once(format!(
+                                "wrote {} ({} lines) from {}",
+                                p,
+                                body.matches('\n').count() + 1,
+                                path
+                            )))
+                            .collect(),
                     );
                 }
-                None => emit(
-                    &a,
-                    obj(vec![
-                        ("sig", jstr(&sig)),
-                        ("path", jstr(&path)),
-                        ("body", jstr(&body)),
-                    ]),
-                    body.split('\n').map(str::to_string).collect(),
-                ),
+                None => {
+                    let mut lines: Vec<String> = body.split('\n').map(str::to_string).collect();
+                    if !note.is_empty() {
+                        lines.insert(0, note);
+                    }
+                    emit(
+                        &a,
+                        obj(vec![
+                            ("sig", jstr(&sig)),
+                            ("path", jstr(&path)),
+                            ("candidates", candidates.to_string()),
+                            ("body", jstr(&body)),
+                        ]),
+                        lines,
+                    )
+                }
             }
             Ok(0)
         }
 
         "modules" => {
-            let rows = list_modules(&root, db)?;
+            let listing = list_modules(&root, db, a.rules.as_deref().unwrap_or(""))?;
+            let rows = &listing.rows;
             emit(
                 &a,
                 arr(rows
@@ -464,6 +532,10 @@ pub fn run(a: Args) -> Result<i32, String> {
                             m.system
                         )
                     })
+                    .chain(std::iter::once(format!(
+                        "taxonomy: {}",
+                        listing.rules_source
+                    )))
                     .collect(),
             );
             Ok(0)
@@ -486,7 +558,7 @@ pub fn run(a: Args) -> Result<i32, String> {
                 verified_by: a.verified_by.clone(),
                 remaining: a.remaining.clone(),
             };
-            let m = set_module_state(&root, db, &mid, &patch)?;
+            let m = set_module_state(&root, db, &mid, &patch, a.rules.as_deref().unwrap_or(""))?;
             emit(
                 &a,
                 obj(vec![
@@ -530,7 +602,7 @@ pub fn run(a: Args) -> Result<i32, String> {
                 .pos
                 .first()
                 .ok_or_else(|| "graph needs a NAME".to_string())?;
-            let rows = graph(&root, db, name, &a.direction, a.limit)?;
+            let rows = graph(&root, db, name, &a.direction, a.limit, a.path.as_deref())?;
             emit(
                 &a,
                 arr(rows
@@ -568,7 +640,9 @@ pub fn run(a: Args) -> Result<i32, String> {
                 .sql
                 .clone()
                 .ok_or_else(|| "sql needs --sql QUERY".to_string())?;
-            let d = crate::db::Db::open(&crate::db::db_path_for(&root, db), true)?;
+            // Same guard as every other command: "there is no index here" is an
+            // instruction, not a raw SQLite "no such table" error.
+            let d = crate::db::open_existing(&root, db, true)?;
             let mut st = d.prepare(&q)?;
             let params: Vec<Val> = a.params.iter().map(|p| Val::Text(p.clone())).collect();
             st.bind_all(&params)?;

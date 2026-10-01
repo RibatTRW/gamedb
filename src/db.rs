@@ -1,7 +1,8 @@
-//! SQLite via the C ABI. `winsqlite3.dll` ships with Windows 10 1809+, so the
-//! binary links against it directly: no cargo dependency, no vendored C source,
-//! no build step, nothing to install. Swap the `#[link]` name for `sqlite3` to
-//! build against a normal system SQLite instead.
+//! SQLite via the C ABI. `winsqlite3.dll` ships with Windows 10 1809+, so on
+//! Windows the binary links against it directly: no cargo dependency, no
+//! vendored C source, no build step, nothing to install. Elsewhere the same
+//! declarations link against the platform's `sqlite3`. Both are picked by
+//! `cfg_attr`, so a clean checkout builds on any host without hand-editing.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,8 @@ const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
 const SQLITE_NULL: c_int = 5;
 const SQLITE_TRANSIENT: isize = -1;
 
-#[link(name = "winsqlite3")]
+#[cfg_attr(windows, link(name = "winsqlite3"))]
+#[cfg_attr(not(windows), link(name = "sqlite3"))]
 extern "C" {
     fn sqlite3_open_v2(
         filename: *const c_char,
@@ -324,17 +326,20 @@ extern "C" {
     fn sqlite3_free(p: *mut c_void);
 }
 
-/// Schema text is tab-indented to match the TypeScript original byte for byte,
-/// so a strict `sqlite_master` dump diff between the two builds is free.
+/// Every column the writer uses is declared here, so a fresh database is
+/// complete without `migrate()` having run. `migrate()` stays for databases
+/// written by an older build, where the columns genuinely do not exist yet.
 pub const SCHEMA: &str = r#"
 		CREATE TABLE IF NOT EXISTS files(
 			id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
 			mtime INTEGER NOT NULL, size INTEGER NOT NULL,
-			edges_mtime INTEGER NOT NULL DEFAULT 0);
+			edges_mtime INTEGER NOT NULL DEFAULT 0,
+			module TEXT);
 		CREATE TABLE IF NOT EXISTS functions(
 			id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL,
 			name TEXT NOT NULL, params TEXT, sig TEXT,
-			start_line INTEGER, end_line INTEGER);
+			start_line INTEGER, end_line INTEGER,
+			sym_id INTEGER);
 		CREATE INDEX IF NOT EXISTS functions_name ON functions(name);
 		CREATE TABLE IF NOT EXISTS strings(
 			id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL,
@@ -366,7 +371,8 @@ pub fn db_path_for(root: &Path, db_override: Option<&str>) -> PathBuf {
     }
 }
 
-/// Additive migrations for databases written by an older build.
+/// Additive migrations for databases written by an older build. Every DDL here
+/// is also present in `SCHEMA`; this exists only for files already on disk.
 pub fn migrate(db: &Db) -> Result<()> {
     for (ddl, col, tbl) in [
         (

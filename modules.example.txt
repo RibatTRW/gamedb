@@ -1,0 +1,73 @@
+# gamedb module rules -- example.
+#
+# Copy to <your-root>/.gamedb/modules.txt and edit, or point at it with
+#     gamedb index -r SRC --rules path/to/modules.txt
+# With no rules file, gamedb derives a taxonomy from the corpus's own directory
+# structure, so this file is optional. It exists because a derived taxonomy is
+# named after directories, and a real one is named after what the code is for.
+#
+# Format, one rule per line:
+#
+#     <selector> <TAB> <module_id> [<TAB> <system>] [<TAB|WSP> @depth=N]
+#
+# Spaces work as well as tabs, so the file stays readable. `#` starts a comment.
+# The first two columns are required; a malformed line is an error that names
+# the file and line, never a silent skip.
+#
+# A module id is yours to choose. Something like `domain.player` (the thing it
+# is) or `core.audio` (the layer it is) both work. `system` is the free-text
+# group shown next to it, e.g. "Runtime", "Content", "Platform".
+#
+# ---------------------------------------------------------------------------
+# Selectors
+#
+#   b:Player.cs      one exact file, by base name
+#   n:Acme.Audio     a namespace and everything under it
+#   x:Acme           that namespace and nothing under it
+#   m:audio          any path segment with that name
+#   Acme.Audio       shorthand for n:Acme.Audio
+#
+# ---------------------------------------------------------------------------
+# How a file is chosen
+#
+# gamedb tries every rule and keeps the most specific one, so the order of the
+# lines does not matter and a broad rule cannot quietly shadow a narrow one.
+# Most specific first:
+#
+#   1. b:  you named the file itself
+#   2. x:  you named a namespace exactly, excluding its children
+#   3. n:  you named a namespace prefix -- the longer prefix wins
+#   4. m:  you named a directory -- the fallback bucket
+#
+# A file's namespace is the first `namespace` it declares, or its directory
+# chain dotted together (`src/net/http/Sock.cs` -> `src.net.http`) when it
+# declares none. That fallback is why `m:` rules work on C and on generated
+# code that has no namespaces at all.
+#
+# Files that match nothing are reported in an `unmapped` bucket by
+# `gamedb modules` rather than dropped, so a gap in the rules is visible
+# instead of silently shrinking the plan.
+#
+# `@depth=N` is for the rare rule that wants to claim a namespace it is too
+# wide for: `n:Acme @depth=1` also matches the bare `namespace Acme;` instead of
+# requiring a second segment.
+
+# --- a normal layered codebase -------------------------------------------
+# Catch-alls last, purely for readability. Ordering is decided by specificity,
+# so moving these to the top changes nothing.
+x:Acme					core.acme			Platform
+n:Acme.Audio				core.audio			Runtime
+n:Acme.Rendering			core.rendering		Runtime
+n:Acme.Content			domain.content		Content
+n:Acme.Audio.Widgets		domain.content		Content
+n:Acme					core.acme			Platform
+
+# --- generated code, which has no namespaces and one file per type ---------
+m:generated				build.generated		Generated
+b:AssemblyInfo.cs		build.meta			Generated
+
+# --- the exceptions, named one at a time ---------------------------------
+# When one file inside a namespace needs a different home, name the file. It
+# outranks the namespace rule no matter which line it sits on.
+b:Player.cs				core.player			Runtime
+b:NetworkManager.cs		domain.multiplayer	Domain

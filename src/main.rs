@@ -1,10 +1,4 @@
-mod cli;
-mod db;
-mod modules;
-mod parse;
-mod rx;
-mod selftest;
-mod store;
+use gamedb::cli;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();

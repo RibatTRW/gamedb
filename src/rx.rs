@@ -12,9 +12,64 @@ pub fn is_word(c: char) -> bool {
 pub fn is_word_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
-/// `[\w<>\[\],.?]`
+/// `[\w<>\[\],.?*]` -- `*` is here so a pointer return type or a by-pointer
+/// parameter does not abort the C# prefix scan before it reaches the name.
 pub fn is_tok(c: char) -> bool {
-    is_word(c) || matches!(c, '<' | '>' | '[' | ']' | ',' | '.' | '?')
+    is_word(c) || matches!(c, '<' | '>' | '[' | ']' | ',' | '.' | '?' | '*')
+}
+
+/// True for the tokens that sit *between* a return type and the function's name:
+/// calling conventions (MSVC, GCC/Clang itanium, MinGW), storage classes and
+/// inlining hints. Decompilers emit these unasked - `undefined4 * __thiscall
+/// FUN_004087c6(void)` is Ghidra's standard shape - and a matcher that assumes
+/// "second token is the name" silently drops every one of them.
+///
+/// The rule is structural rather than a fixed list: any `__`-prefixed
+/// convention spelling ends in `call` (`__stdcall`, `__fastcall`, `__thiscall`,
+/// `__vectorcall`, `__clrcall`, `__swiftcall`, ...) or `decl` (`__cdecl`). The
+/// explicit cases cover the uppercase Windows spellings, which have no prefix.
+pub fn is_modifier_tok(w: &str) -> bool {
+    if w.starts_with("__") && (w.ends_with("call") || w.ends_with("decl")) {
+        return true;
+    }
+    matches!(
+        w,
+        "WINAPI"
+            | "APIENTRY"
+            | "CALLBACK"
+            | "extern"
+            | "static"
+            | "inline"
+            | "__inline"
+            | "__forceinline"
+            | "noinline"
+            | "__declspec"
+    )
+}
+
+/// Character offset of the `)` that closes the `(` at `open`, counting nested
+/// parens. Returns `None` if they never balance.
+///
+/// Deliberately paren-aware rather than "scan to the first `)`": a
+/// function-pointer parameter (`int (*cb)(int)`) or a nested generic would
+/// otherwise close the scan early and the whole header would be dropped.
+fn close_paren(s: &[char], open: usize) -> Option<(usize, String)> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < s.len() {
+        match s[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i, s[open + 1..i].iter().collect()));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn read_word(s: &[char], i: usize) -> Option<(String, usize)> {
@@ -59,14 +114,7 @@ fn tail(s: &[char], i: usize) -> Option<(String, String)> {
     if k >= s.len() || s[k] != '(' {
         return None;
     }
-    let mut pe = k + 1;
-    while pe < s.len() && s[pe] != ')' && s[pe] != '(' {
-        pe += 1;
-    }
-    if pe >= s.len() || s[pe] != ')' {
-        return None;
-    }
-    let params: String = s[k + 1..pe].iter().collect();
+    let (pe, params) = close_paren(s, k)?;
     let k = skip_ws(s, pe + 1);
     if k >= s.len() || s[k] != '{' {
         return None;
@@ -77,15 +125,28 @@ fn tail(s: &[char], i: usize) -> Option<(String, String)> {
     Some((name, params))
 }
 
-/// `HEADER`: optional `Type <*>* ` then the tail, then an optional `/*...*/` comment.
+/// `HEADER`: optional `Type <*>* `, optional modifier words, then the tail,
+/// then an optional `/*...*/` comment.
 pub fn match_header(s: &[char]) -> Option<(String, String)> {
-    // ^\s*(?:WORD(?:\s*\*)*\s+)?(WORD)\s*\(([^()]*)\)\s*(?:/\*.*)?\{\s*$
+    // ^\s*(?:WORD(?:\s*\*)*\s+(?:MOD\s+)*)?(WORD)\s*\(([^()]*)\)\s*(?:/\*.*)?\{\s*$
     let p = skip_ws(s, 0);
+    // Storage and calling-class keywords may lead the whole declaration rather
+    // than sit in the name slot: `static inline int f(`, `extern void g(`.
+    // Skipping them first is what lets the type word below be the type.
+    let mut head = p;
+    loop {
+        let r = skip_ws(s, head);
+        match read_word(s, r) {
+            Some((w, j)) if is_modifier_tok(&w) => head = j,
+            _ => break,
+        }
+    }
+    let head = skip_ws(s, head);
     // Optional `(?:TYPE\s*\*\s+)?`: pointer stars live *before* the name and must be
     // separated from it by whitespace, so `char **foo(` is deliberately rejected.
-    let mut name_at = p;
-    if p < s.len() && is_word_start(s[p]) {
-        if let Some((_, after)) = read_word(s, p) {
+    let mut name_at = head;
+    if head < s.len() && is_word_start(s[head]) {
+        if let Some((_, after)) = read_word(s, head) {
             let mut q = after;
             loop {
                 let r = skip_ws(s, q);
@@ -93,6 +154,19 @@ pub fn match_header(s: &[char]) -> Option<(String, String)> {
                     q = r + 1;
                 } else {
                     break;
+                }
+            }
+            // Calling conventions and storage hints sit in the same slot as a
+            // second type word: `void __thiscall f(`, `static inline int g(`.
+            loop {
+                let r = skip_ws(s, q);
+                if r < s.len() && s[r] == '*' {
+                    q = r + 1;
+                    continue;
+                }
+                match read_word(s, r) {
+                    Some((w, j)) if r > q && is_modifier_tok(&w) => q = j,
+                    _ => break,
                 }
             }
             let k = skip_ws(s, q);
@@ -109,11 +183,7 @@ pub fn match_header(s: &[char]) -> Option<(String, String)> {
     if k >= s.len() || s[k] != '(' {
         return None;
     }
-    let close = (k + 1..s.len()).find(|&x| s[x] == ')' || s[x] == '(')?;
-    if s[close] != ')' {
-        return None;
-    }
-    let params = s[k + 1..close].iter().copied().collect::<String>();
+    let (close, params) = close_paren(s, k)?;
     // only `\s*` and an optional `/* */` may sit between `)` and `{` - the regex
     // does not tolerate a trailing `throws ...`, which is why Java constructors
     // that declare one are not indexed.
@@ -325,36 +395,6 @@ pub fn scan_str_lits(s: &[char], out: &mut Vec<(usize, usize)>) {
         }
         i += 1;
     }
-}
-
-/// `NS_RE` = `^\s*namespace\s+([\w.]+)` with `re.M`. `\s` crosses newlines, so
-/// the search restarts at every line start and may consume blank lines to reach
-/// a `namespace` that is not itself at column 0.
-pub fn find_namespace(src: &[char]) -> Option<String> {
-    const KW: &str = "namespace";
-    let kw: Vec<char> = KW.chars().collect();
-    let mut p = 0;
-    while p <= src.len() {
-        let mut i = p;
-        while i < src.len() && is_ws(src[i]) {
-            i += 1;
-        }
-        if i + kw.len() <= src.len() && src[i..i + kw.len()] == kw[..] {
-            let j = skip_ws(src, i + kw.len());
-            if j < src.len() && is_word_start(src[j]) {
-                let mut k = j;
-                while k < src.len() && (is_word(src[k]) || src[k] == '.') {
-                    k += 1;
-                }
-                return Some(src[j..k].iter().collect());
-            }
-        }
-        match src[p..].iter().position(|&c| c == '\n') {
-            Some(off) => p = p + off + 1,
-            None => break,
-        }
-    }
-    None
 }
 
 /// `^[0-9a-fA-F\s]+$` — a "hex literal" that is really just a checksum.

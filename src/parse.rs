@@ -9,6 +9,103 @@ use std::sync::OnceLock;
 pub const MAX_STRINGS_PER_FILE: usize = 5000;
 pub const MAX_CALLEES_PER_FN: usize = 1000;
 
+/// Longest run of physical lines one header may span. A wrapped parameter list
+/// is two or three lines even after a decompiler formats it; eight is past
+/// anything real and stops a runaway join on a stray unbalanced `(`.
+pub const MAX_HEADER_LINES: usize = 8;
+
+/// Did the parentheses open and then balance? A bare `)` never counts, so this
+/// distinguishes "header complete" from "not a signature".
+fn parens_balanced(s: &[char]) -> bool {
+    let mut depth = 0i32;
+    for &c in s {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Can line `li` legitimately continue onto the next one? Only a *declaration*
+/// wraps: a call site (`Foo(`, `bar.baz(`) has nothing but a name before its
+/// `(`, so requiring whitespace there keeps multi-line joining from turning a
+/// wrapped argument list into a phantom function header. Continuation lines are
+/// already inside an unbalanced parameter list and need no such test.
+fn can_join(masked: &[char], lr: &[(usize, usize)], li: usize) -> bool {
+    let line = masked[lr[li].0..lr[li].1].to_vec();
+    match line.iter().position(|&c| c == '(') {
+        Some(p) => line[..p].iter().any(|&c| is_ws(c) && c != '\r'),
+        None => false,
+    }
+}
+
+/// Join the declaration at `li` into one line, following the header across
+/// physical lines until its parentheses balance, then accepting a `{` either on
+/// that same line or alone on the next non-blank one. Returns the joined text
+/// and the line holding the opening brace.
+///
+/// Three shapes, one code path:
+/// ```text
+/// int f(int a) {                 one line
+/// void f(int a)                  Allman: `)` ends the line
+///     {                          ` { ` alone on the next
+/// void f(int a,                  wrapped: parameters across lines
+///      int b) {
+/// ```
+pub fn join_header(
+    masked: &[char],
+    lr: &[(usize, usize)],
+    li: usize,
+) -> Option<(Vec<char>, usize)> {
+    let mut cand: Vec<char> = Vec::new();
+    let mut hdr_end = li;
+    loop {
+        let seg = trim_line(&masked[lr[hdr_end].0..lr[hdr_end].1]);
+        if hdr_end > li {
+            cand.push(' ');
+        }
+        cand.extend(seg.iter().copied());
+        if parens_balanced(&cand) || hdr_end - li >= MAX_HEADER_LINES - 1 {
+            break;
+        }
+        if hdr_end == li && !can_join(masked, lr, li) {
+            return None;
+        }
+        hdr_end += 1;
+        if hdr_end >= lr.len() {
+            return None;
+        }
+    }
+    if !parens_balanced(&cand) {
+        return None;
+    }
+    let cand = strip_where_throws(&cand);
+    if cand.last() == Some(&'{') {
+        return Some((cand, hdr_end));
+    }
+    let mut nx = hdr_end + 1;
+    while nx < lr.len() && trim_line(&masked[lr[nx].0..lr[nx].1]).is_empty() {
+        nx += 1;
+    }
+    if nx >= lr.len() || trim_line(&masked[lr[nx].0..lr[nx].1]) != ['{'] {
+        return None;
+    }
+    let mut cand = cand;
+    cand.push(' ');
+    cand.push('{');
+    Some((cand, nx))
+}
+
 fn not_a_func() -> &'static HashSet<&'static str> {
     static S: OnceLock<HashSet<&'static str>> = OnceLock::new();
     S.get_or_init(|| {
@@ -177,14 +274,6 @@ pub fn chomp(s: &[char]) -> &[char] {
     &s[..b]
 }
 
-fn trim_ws_end(s: &[char]) -> &[char] {
-    let mut b = s.len();
-    while b > 0 && is_ws(s[b - 1]) {
-        b -= 1;
-    }
-    &s[..b]
-}
-
 fn trim_line(s: &[char]) -> &[char] {
     trim_ws(chomp(s))
 }
@@ -222,8 +311,8 @@ pub struct Parsed {
     pub syms: Vec<Sym>,
 }
 
-/// Assumes one-line signatures, true for Ghidra/IDA C and ILSpy C#. A
-/// multi-line signature would need paren-aware joining.
+/// Assumes one-line signatures, true for Ghidra/IDA C and ILSpy C#. Wrapped
+/// signatures are stitched by `join_header`.
 pub fn parse_source(src: &[char]) -> Parsed {
     let masked = mask(src, true);
     let no_comments = mask(src, false);
@@ -255,37 +344,15 @@ pub fn parse_source(src: &[char]) -> Parsed {
             li += 1;
             continue;
         }
-        // Allman braces: `)` closes the header, `{` sits alone on the next line.
-        let mut brace_line = li;
-        let mut cand: Vec<char> = line.to_vec();
-        if !line
-            .iter()
-            .rev()
-            .find(|&&c| c != ' ' && c != '\t' && c != '\r')
-            .is_some_and(|&c| c == '{')
-        {
-            let stripped = m::strip_where_throws(line);
-            let bare = trim_ws_end(&stripped);
-            let mut nx = li + 1;
-            while nx < lr.len() && trim_ws(&masked[lr[nx].0..lr[nx].1]).is_empty() {
-                nx += 1;
-            }
-            if nx >= lr.len() {
+        // Allman braces and wrapped parameter lists are both handled by the
+        // same joiner, which reports which line the opening brace landed on.
+        let (cand, brace_line) = match join_header(&masked, &lr, li) {
+            Some(v) => v,
+            None => {
                 li += 1;
                 continue;
             }
-            let nxt = trim_ws(&masked[lr[nx].0..lr[nx].1]);
-            if !bare.last().is_some_and(|&c| c == ')') || nxt.len() != 1 || nxt[0] != '{' {
-                li += 1;
-                continue;
-            }
-            brace_line = nx;
-            // Rejoin the header with the `{` that lives on its own line, so the
-            // tail matcher sees the same shape it sees on one line.
-            cand = bare.to_vec();
-            cand.push(' ');
-            cand.push('{');
-        }
+        };
 
         let hit = m::match_header(&cand).or_else(|| m::match_csharp_header(&cand));
         let (name, params) = match hit {
@@ -453,9 +520,4 @@ pub fn scan_calls(
         }
     }
     out
-}
-
-/// `NS_RE` over the whole file, for namespace fallback.
-pub fn find_namespace(src: &[char]) -> Option<String> {
-    m::find_namespace(src)
 }

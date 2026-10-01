@@ -1,6 +1,6 @@
 //! Filesystem walk, incremental indexing, and every read query.
 
-use crate::db::{open_existing, open_schema, Val};
+use crate::db::{open_existing, open_schema, Db, Val};
 use crate::modules::*;
 use crate::parse::{chomp, line_ranges, mask, parse_source, scan_calls, MAX_STRINGS_PER_FILE};
 use std::collections::HashMap;
@@ -9,12 +9,22 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const MAX_ROWS: usize = 60;
 
-const SRC_EXT: [&str; 22] = [
-    "c", "h", "cpp", "hpp", "cc", "asm", "txt", "cs", "java", "kt", "kts", "scala", "swift", "go",
-    "rs", "js", "jsx", "mjs", "cjs", "ts", "tsx", "php",
+/// Extensions the parser is pointed at. Only brace-delimited languages with a
+/// declaration-shaped header survive the text heuristics here, so this is the
+/// supported set and not "every extension that might contain text": `txt` is
+/// absent on purpose (stray prose indexes as strings but never as code) and
+/// `asm` is present on purpose (decompilers emit it). A slice, so adding one is
+/// an ordinary edit rather than a count that has to be kept true by hand.
+/// Extensions the parser is willing to read. All of them are brace-delimited
+/// languages except the last three, which are the formats decompilers and
+/// disassemblers actually emit alongside code: a header dumped to `.txt`, a
+/// disassembly listing, a `package:` target. Dropping those from the list
+/// would not make the index cleaner, it would make it quietly incomplete --
+/// the exact defect this file's reporting exists to prevent.
+const SRC_EXT: &[&str] = &[
+    "c", "h", "cpp", "hpp", "cc", "cs", "java", "kt", "kts", "scala", "swift", "go", "rs", "dart",
+    "js", "jsx", "mjs", "cjs", "ts", "tsx", "php", "txt", "asm",
 ];
-// .dart is in the original's list too; kept out of the const array only to hold
-// the count at 22 -- both are checked below.
 const SKIP_DIR: [&str; 8] = [
     "node_modules",
     ".git",
@@ -28,17 +38,74 @@ const SKIP_DIR: [&str; 8] = [
 
 fn has_src_ext(name: &str) -> bool {
     match name.rfind('.') {
-        Some(i) => {
-            let e = name[i + 1..].to_ascii_lowercase();
-            SRC_EXT.contains(&e.as_str()) || e == "dart"
-        }
+        Some(i) => SRC_EXT.contains(&name[i + 1..].to_ascii_lowercase().as_str()),
         None => false,
     }
 }
 
+fn from_utf16(bytes: &[u8], le: bool) -> String {
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| {
+            if le {
+                u16::from_le_bytes(*c)
+            } else {
+                u16::from_be_bytes(*c)
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Decode one source file, and say when the text is not plain UTF-8.
+///
+/// Decompilers emit UTF-16 (with and without a BOM) and legacy code pages.
+/// Decoding those as UTF-8 does not fail loudly -- it turns every non-ASCII
+/// Decode source bytes to a `String`, reporting the encoding instead of hiding
+/// it. `from_utf8_lossy` on a UTF-16 dump turns every identifier into `U+FFFD`
+/// while every line offset stays correct, so the damage is invisible in the
+/// counts -- the one failure mode that silently corrupts an index. Returns the
+/// text plus a note when the input was not plain UTF-8.
+pub fn decode(bytes: Vec<u8>) -> (String, Option<&'static str>) {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return (String::from_utf8_lossy(&bytes[3..]).into_owned(), None);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return (from_utf16(&bytes[2..], true), Some("utf-16le"));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return (from_utf16(&bytes[2..], false), Some("utf-16be"));
+    }
+    // BOM-less UTF-16 has no marker but does have a shape: ASCII source spells
+    // every code unit as `c,0` little-endian or `0,c` big-endian, and NUL is
+    // valid UTF-8, so this has to be tested BEFORE handing the bytes to the
+    // UTF-8 decoder. Two consecutive code units is enough to tell.
+    if bytes.len() >= 4 && bytes.len().is_multiple_of(2) {
+        let le = bytes[1] == 0 && bytes[0] != 0 && bytes[3] == 0 && bytes[2] != 0;
+        let be = bytes[0] == 0 && bytes[1] != 0 && bytes[2] == 0 && bytes[3] != 0;
+        if le {
+            return (from_utf16(&bytes, true), Some("utf-16le, no BOM"));
+        }
+        if be {
+            return (from_utf16(&bytes, false), Some("utf-16be, no BOM"));
+        }
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) => (s, None),
+        Err(e) => {
+            let b = e.into_bytes();
+            (
+                String::from_utf8_lossy(&b).into_owned(),
+                Some("not valid utf-8 (lossy)"),
+            )
+        }
+    }
+}
+
 fn read_lossy(p: &Path) -> std::io::Result<Vec<char>> {
-    let bytes = std::fs::read(p)?;
-    Ok(String::from_utf8_lossy(&bytes).chars().collect())
+    Ok(decode(std::fs::read(p)?).0.chars().collect())
 }
 
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
@@ -49,20 +116,64 @@ fn mtime_ms(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// A walk that reports what it could not read. The old version swallowed the
+/// error and the index simply lacked those files, which makes a partial index
+/// indistinguishable from a complete one.
+pub struct Walked {
+    pub files: Vec<PathBuf>,
+    pub failures: Vec<String>,
+}
+
+/// Bounded problem log: enough to find the culprit, never enough to flood the
+/// output of a badly configured tree.
+pub const MAX_REPORTED_PROBLEMS: usize = 20;
+
+#[derive(Debug, Default, Clone)]
+pub struct Problems {
+    pub items: Vec<String>,
+    pub total: i64,
+}
+
+impl Problems {
+    pub fn add(&mut self, s: String) {
+        self.total += 1;
+        if self.items.len() < MAX_REPORTED_PROBLEMS {
+            self.items.push(s);
+        }
+    }
+}
+
 /// Iterative walk; never recurses, so a deep tree cannot blow the stack.
-pub fn walk(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+pub fn walk(root: &Path) -> Walked {
+    let mut out = Walked {
+        files: Vec::new(),
+        failures: Vec::new(),
+    };
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                out.failures.push(format!("{}: {}", dir.display(), e));
+                continue;
+            }
         };
-        for e in rd.flatten() {
+        for e in rd {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    out.failures.push(format!("{}: {}", dir.display(), err));
+                    continue;
+                }
+            };
             let name = e.file_name().to_string_lossy().into_owned();
             let ft = match e.file_type() {
                 Ok(t) => t,
-                Err(_) => continue,
+                Err(err) => {
+                    out.failures
+                        .push(format!("{}: {}", e.path().display(), err));
+                    continue;
+                }
             };
             if name.starts_with('.') && name != ".gamedb" {
                 continue;
@@ -72,14 +183,14 @@ pub fn walk(root: &Path) -> Vec<PathBuf> {
                     stack.push(e.path());
                 }
             } else if has_src_ext(&name) {
-                out.push(e.path());
+                out.files.push(e.path());
             }
         }
     }
     out
 }
 
-fn rel_of(root: &Path, full: &Path) -> String {
+pub fn rel_of(root: &Path, full: &Path) -> String {
     let s = full
         .strip_prefix(root)
         .unwrap_or(full)
@@ -96,8 +207,12 @@ pub struct Report {
     pub symbols: i64,
     pub edges: i64,
     pub skipped: i64,
-    pub failed: i64,
+    /// Files that could not be walked or read, each with its path.
+    pub failed: Problems,
+    /// Files that were not plain UTF-8, each with its path and encoding.
+    pub decoded: Problems,
     pub seconds: f64,
+    pub rules: String,
 }
 
 pub fn index_root(
@@ -106,10 +221,50 @@ pub fn index_root(
     verbose: i64,
     dry_run: bool,
     force: bool,
+    rules_spec: &str,
 ) -> crate::db::Result<Report> {
     let t0 = Instant::now();
     let db = open_schema(root, db_override, !dry_run)?;
     let mut rep = Report::default();
+
+    // One transaction for the whole pass: a killed or erroring run leaves the
+    // index exactly as it was instead of half-written, and the bulk inserts
+    // stop paying a commit each.
+    struct Tx<'a> {
+        db: &'a Db,
+        open: bool,
+    }
+    impl<'a> Tx<'a> {
+        fn begin(db: &'a Db) -> crate::db::Result<Self> {
+            db.exec("BEGIN")?;
+            Ok(Tx { db, open: true })
+        }
+        fn commit(mut self) -> crate::db::Result<()> {
+            self.open = false;
+            self.db.exec("COMMIT")?;
+            Ok(())
+        }
+    }
+    impl Drop for Tx<'_> {
+        fn drop(&mut self) {
+            if self.open {
+                let _ = self.db.exec("ROLLBACK");
+            }
+        }
+    }
+    let tx = if dry_run { None } else { Some(Tx::begin(&db)?) };
+
+    let walked = walk(root);
+    for f in &walked.failures {
+        rep.failed.add(f.clone());
+    }
+    let rels: Vec<String> = walked.files.iter().map(|p| rel_of(root, p)).collect();
+    let rules = load_rule_set(root, rules_spec, &rels)?;
+    rep.rules = rules.source.clone();
+    if verbose > 0 {
+        let (nr, nm) = rules.counts();
+        eprintln!("modules: {nr} rules -> {nm} modules ({})", rules.source);
+    }
     let mut known: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
     if !dry_run {
         for r in db.query("SELECT id,path,mtime,size,edges_mtime FROM files", &[])? {
@@ -134,24 +289,26 @@ pub fn index_root(
         for r in nulls {
             let fid = r[0].as_i64();
             let rel = r[1].as_str().to_string();
-            if let Ok(chars) = read_lossy(&root.join(&rel)) {
-                db.run(
-                    "UPDATE files SET module=? WHERE id=?",
-                    &[
-                        Val::Text(module_of(&rel, Some(&chars)).0.into()),
-                        Val::Int(fid),
-                    ],
-                )?;
+            match read_lossy(&root.join(&rel)) {
+                Ok(chars) => {
+                    let text: String = chars.into_iter().collect();
+                    let module = rules.module_of(&rel, Some(&text)).0.to_string();
+                    db.run(
+                        "UPDATE files SET module=? WHERE id=?",
+                        &[Val::Text(module), Val::Int(fid)],
+                    )?
+                }
+                Err(e) => rep.failed.add(format!("{rel}: {e}")),
             }
         }
     }
 
-    for full in walk(root) {
-        let rel = rel_of(root, &full);
-        let md = match std::fs::metadata(&full) {
+    for full in walked.files.iter() {
+        let rel = rel_of(root, full);
+        let md = match std::fs::metadata(full) {
             Ok(m) => m,
-            Err(_) => {
-                rep.failed += 1;
+            Err(e) => {
+                rep.failed.add(format!("{rel}: {e}"));
                 continue;
             }
         };
@@ -169,13 +326,17 @@ pub fn index_root(
             rep.skipped += 1;
             continue;
         }
-        let src = match read_lossy(&full) {
-            Ok(s) => s,
-            Err(_) => {
-                rep.failed += 1;
+        let (text, encoding) = match std::fs::read(full) {
+            Ok(b) => decode(b),
+            Err(e) => {
+                rep.failed.add(format!("{rel}: {e}"));
                 continue;
             }
         };
+        if let Some(enc) = encoding {
+            rep.decoded.add(format!("{rel}: {enc}"));
+        }
+        let src: Vec<char> = text.chars().collect();
         let parsed = parse_source(&src);
         if verbose > 0 && (rep.files + 1) % verbose == 0 {
             eprint!("\r{} files", rep.files + 1);
@@ -214,7 +375,7 @@ pub fn index_root(
             db.run(
                 "UPDATE files SET module=? WHERE id=?",
                 &[
-                    Val::Text(module_of(&rel, Some(&src)).0.into()),
+                    Val::Text(rules.module_of(&rel, Some(&text)).0.into()),
                     Val::Int(file_id),
                 ],
             )?;
@@ -312,7 +473,7 @@ pub fn index_root(
                 "INSERT INTO edges(src_id,dst_id,line,hits) VALUES (?,?,?,1) \
                  ON CONFLICT(src_id,dst_id) DO UPDATE SET hits=hits+1",
             )?;
-            db.exec("BEGIN")?;
+            // no BEGIN/COMMIT here: the outer transaction covers the whole pass
             for (rel, mt, file_id) in &queue {
                 let chars = match read_lossy(&root.join(rel)) {
                     Ok(c) => c,
@@ -345,8 +506,10 @@ pub fn index_root(
                     &[Val::Int(*mt), Val::Int(*file_id)],
                 )?;
             }
-            db.exec("COMMIT")?;
         }
+    }
+    if let Some(t) = tx {
+        t.commit()?;
     }
     rep.seconds = t0.elapsed().as_secs_f64();
     Ok(rep)
@@ -440,23 +603,35 @@ pub fn search_strings(
     )
 }
 
+/// Read one function body. `path_hint` is a substring match on the owning file
+/// path: overloads, partial classes and decompiler `FUN_` names are all common
+/// enough that picking the shortest path silently returns the wrong body half
+/// the time. The caller also gets the number of candidates, so a read that
+/// matched several definitions says so instead of pretending there was one.
 pub fn read_function(
     root: &Path,
     db_override: Option<&str>,
     name: &str,
-) -> crate::db::Result<Option<(String, String, String)>> {
+    path_hint: Option<&str>,
+) -> crate::db::Result<Option<(String, String, String, usize)>> {
     let db = open_schema(root, db_override, false)?;
-    let row = db.query_one(
-        "SELECT f.name,f.sig,f.start_line,f.end_line,p.path FROM functions f \
-         JOIN files p ON p.id=f.file_id WHERE f.name=? ORDER BY LENGTH(p.path) LIMIT 1",
+    let mut rows = db.query(
+        "SELECT f.sig,f.start_line,f.end_line,p.path FROM functions f \
+         JOIN files p ON p.id=f.file_id WHERE f.name=? ORDER BY LENGTH(p.path), p.path",
         &[Val::Text(name.into())],
     )?;
-    let Some(r) = row else { return Ok(None) };
-    let path = r[4].as_str().to_string();
+    if let Some(hint) = path_hint.filter(|h| !h.is_empty()) {
+        rows.retain(|r| r[3].as_str().contains(hint));
+    }
+    let total = rows.len();
+    let Some(r) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let path = r[3].as_str().to_string();
     let chars = read_lossy(&root.join(&path)).map_err(|e| format!("{}: {}", path, e))?;
     let lr = line_ranges(&chars);
-    let start = r[2].as_i64() as usize;
-    let end = r[3].as_i64() as usize;
+    let start = r[1].as_i64() as usize;
+    let end = r[2].as_i64() as usize;
     // start_line/end_line are inclusive 1-based, and the body is joined with
     // "\n" - a CRLF tree reads back the same as an LF one, as in the reference.
     let body: String = (start..=end)
@@ -464,7 +639,7 @@ pub fn read_function(
         .map(|&(a, b)| String::from_iter(chomp(&chars[a..b])))
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(Some((r[1].as_str().to_string(), path, body)))
+    Ok(Some((r[0].as_str().to_string(), path, body, total)))
 }
 
 pub fn graph(
@@ -473,8 +648,15 @@ pub fn graph(
     name: &str,
     direction: &str,
     limit: usize,
+    path_hint: Option<&str>,
 ) -> crate::db::Result<Vec<Vec<Val>>> {
     let db = open_schema(root, db_override, false)?;
+    // `pf` is the anchor's own file. Without the path filter a duplicated name
+    // blends the edges of every function that happens to share it.
+    let (hint, like) = match path_hint.filter(|h| !h.is_empty()) {
+        Some(h) => (Val::Text(h.into()), Val::Text(format!("%{h}%"))),
+        None => (Val::Null, Val::Null),
+    };
     let side =
         |label: &str, peer_key: &str, anchor_key: &str| -> crate::db::Result<Vec<Vec<Val>>> {
             // Row: [direction, peer_name, peer_path, call_path, line, hits].
@@ -487,13 +669,21 @@ pub fn graph(
              JOIN symbols  s  ON s.id  = e.{peer_key}  JOIN files ps ON ps.id = s.file_id \
              JOIN symbols fs ON fs.id = e.src_id      JOIN files pf ON pf.id = fs.file_id \
              JOIN functions f ON f.sym_id = e.{anchor_key} \
-             WHERE f.name=? \
+             WHERE f.name=? AND (? IS NULL OR pf.path LIKE ?) \
              ORDER BY 6 DESC LIMIT ?",
                 label = label,
                 peer_key = peer_key,
                 anchor_key = anchor_key
             );
-            db.query(&sql, &[Val::Text(name.into()), Val::Int(limit as i64)])
+            db.query(
+                &sql,
+                &[
+                    Val::Text(name.into()),
+                    hint.clone(),
+                    like.clone(),
+                    Val::Int(limit as i64),
+                ],
+            )
         };
     let mut out = Vec::new();
     if direction == "both" || direction == "callees" {
@@ -505,7 +695,6 @@ pub fn graph(
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
 pub struct ModuleRow {
     pub module_id: String,
     pub system: String,
@@ -518,7 +707,19 @@ pub struct ModuleRow {
     pub functions: i64,
 }
 
-pub fn list_modules(root: &Path, db_override: Option<&str>) -> crate::db::Result<Vec<ModuleRow>> {
+/// The taxonomy in force, plus where it came from -- so a caller never has to
+/// guess whether `modules` is showing a hand-written rule file or buckets the
+/// tool derived from the tree itself.
+pub struct ModuleListing {
+    pub rules_source: String,
+    pub rows: Vec<ModuleRow>,
+}
+
+pub fn list_modules(
+    root: &Path,
+    db_override: Option<&str>,
+    rules_spec: &str,
+) -> crate::db::Result<ModuleListing> {
     let db = open_schema(root, db_override, false)?;
     let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
     for r in db.query(
@@ -528,26 +729,33 @@ pub fn list_modules(root: &Path, db_override: Option<&str>) -> crate::db::Result
     )? {
         counts.insert(r[0].as_str().to_string(), (r[1].as_i64(), r[2].as_i64()));
     }
+    let paths: Vec<String> = db
+        .query("SELECT path FROM files", &[])?
+        .iter()
+        .map(|r| r[0].as_str().to_string())
+        .collect();
+    let rules = load_rule_set(root, rules_spec, &paths)?;
     let mut status: HashMap<String, Vec<Val>> = HashMap::new();
     for r in db.query("SELECT * FROM module_status", &[])? {
         status.insert(r[0].as_str().to_string(), r);
     }
     let mut out: Vec<ModuleRow> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (_, mid, system) in MODULE_RULES.iter() {
+    for r in &rules.rules {
+        let mid: &str = &r.module_id;
         if !seen.insert(mid) {
             continue; // several rules roll up to one module id
         }
-        let (files, functions) = counts.get(*mid).copied().unwrap_or((0, 0));
-        let s = status.get(*mid);
+        let (files, functions) = counts.get(mid).copied().unwrap_or((0, 0));
+        let s = status.get(mid);
         out.push(ModuleRow {
             module_id: mid.to_string(),
-            system: system.to_string(),
-            state: s.map_or(STATE_UNIMPLEMENTED.into(), |r| col(r, 2)),
-            verified: s.map_or(0, |r| coli(r, 3)),
-            verified_by: s.and_then(|r| opt(r, 4)),
-            verified_at: s.and_then(|r| opt(r, 5)),
-            remaining: s.and_then(|r| opt(r, 6)).unwrap_or_else(|| {
+            system: r.system.clone(),
+            state: s.map_or(STATE_UNIMPLEMENTED.into(), |x| col(x, 2)),
+            verified: s.map_or(0, |x| coli(x, 3)),
+            verified_by: s.and_then(|x| opt(x, 4)),
+            verified_at: s.and_then(|x| opt(x, 5)),
+            remaining: s.and_then(|x| opt(x, 6)).unwrap_or_else(|| {
                 format!(
                     "{} function(s) awaiting rewrite + parity evidence",
                     functions
@@ -572,7 +780,10 @@ pub fn list_modules(root: &Path, db_override: Option<&str>) -> crate::db::Result
         });
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.functions));
-    Ok(out)
+    Ok(ModuleListing {
+        rules_source: rules.source,
+        rows: out,
+    })
 }
 
 fn col(r: &[Val], i: usize) -> String {
@@ -605,14 +816,8 @@ pub fn set_module_state(
     db_override: Option<&str>,
     module_id: &str,
     patch: &ModulePatch,
+    rules_spec: &str,
 ) -> crate::db::Result<ModuleRow> {
-    if !is_known_module(module_id) {
-        return Err(format!(
-            "unknown module \"{}\" - run: gamedb modules -r {}",
-            module_id,
-            root.display()
-        ));
-    }
     if let Some(st) = &patch.state {
         if !MODULE_STATES.contains(&st.as_str()) {
             return Err(format!(
@@ -624,6 +829,20 @@ pub fn set_module_state(
     // module_status columns: 0 module_id 1 system 2 state 3 verified
     //                        4 verified_by 5 verified_at 6 remaining
     let db = open_existing(root, db_override, false)?;
+    let paths: Vec<String> = db
+        .query("SELECT path FROM files", &[])?
+        .iter()
+        .map(|r| r[0].as_str().to_string())
+        .collect();
+    let rules = load_rule_set(root, rules_spec, &paths)?;
+    if !rules.is_known(module_id) {
+        return Err(format!(
+            "unknown module \"{}\" -- {}; run: gamedb modules -r {}",
+            module_id,
+            rules.source,
+            root.display()
+        ));
+    }
     let cur = db
         .query_one(
             "SELECT * FROM module_status WHERE module_id=?",
@@ -673,7 +892,7 @@ pub fn set_module_state(
          verified_at=excluded.verified_at, remaining=excluded.remaining",
         &[
             Val::Text(module_id.into()),
-            Val::Text(system_of(module_id).unwrap_or("").into()),
+            Val::Text(rules.system_of(module_id).unwrap_or("").into()),
             Val::Text(state),
             Val::Int(verified),
             by.map(Val::Text).unwrap_or(Val::Null),
@@ -681,7 +900,8 @@ pub fn set_module_state(
             remaining.map(Val::Text).unwrap_or(Val::Null),
         ],
     )?;
-    list_modules(root, db_override)?
+    list_modules(root, db_override, rules_spec)?
+        .rows
         .into_iter()
         .find(|m| m.module_id == module_id)
         .ok_or_else(|| format!("module \"{}\" vanished after write", module_id))
