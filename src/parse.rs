@@ -93,6 +93,19 @@ pub fn join_header(
     if cand.last() == Some(&'{') {
         return Some((cand, hdr_end));
     }
+    // Single-line body: `int f() { return x; }`. Truncate to the opening brace
+    // so the strict matchers see the plain `NAME(params) {` shape; the body
+    // walk in `parse_source` still runs to the end of this same line.
+    if cand.last() == Some(&'}') {
+        if let Some(p) = cand.iter().position(|&c| c == '{') {
+            return Some((cand[..=p].to_vec(), hdr_end));
+        }
+    }
+    // Expression-bodied member (C#): the definition ends in `=> expr ;`, with no
+    // brace. `parse_source` treats the line itself as the body.
+    if cand.last() == Some(&';') && has_arrow(&cand) {
+        return Some((cand, hdr_end));
+    }
     let mut nx = hdr_end + 1;
     while nx < lr.len() && trim_line(&masked[lr[nx].0..lr[nx].1]).is_empty() {
         nx += 1;
@@ -122,6 +135,12 @@ fn not_a_func() -> &'static HashSet<&'static str> {
             "case",
             "defined",
             "FUN",
+            "func",
+            "def",
+            "fn",
+            "fun",
+            "when",
+            "synchronized",
             "foreach",
             "lock",
             "using",
@@ -278,6 +297,108 @@ fn trim_line(s: &[char]) -> &[char] {
     trim_ws(chomp(s))
 }
 
+/// 1-based inclusive line range of the brace body opened at or after `from_line`.
+/// Returns `None` for a forward declaration (`class Foo;`), so a type with no
+/// body does not make every later line count as a member.
+fn brace_body_range(
+    masked: &[char],
+    lr: &[(usize, usize)],
+    from_line: usize,
+) -> Option<(usize, usize)> {
+    let mut li = from_line;
+    let mut found: Option<(usize, usize)> = None;
+    while li < lr.len() {
+        let (a, b) = lr[li];
+        if let Some(p) = masked[a..b].iter().position(|&c| c == '{') {
+            found = Some((li, a + p));
+            break;
+        }
+        if masked[a..b].iter().any(|&c| c == ';') {
+            return None;
+        }
+        li += 1;
+    }
+    let (sli, sc) = found?;
+    let mut depth = 0i32;
+    let mut nl = sli;
+    for &ch in &masked[sc..] {
+        match ch {
+            '\n' => nl += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((sli + 1, nl + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn enclosing_type<'a>(
+    bodies: &'a [(usize, usize, String, &'static str)],
+    line1: usize,
+) -> Option<&'a (usize, usize, String, &'static str)> {
+    bodies.iter().rev().find(|(a, b, _, _)| line1 >= *a && line1 <= *b)
+}
+
+/// Java/C#-style enumerators: the identifiers between an enum body's `{` and
+/// its first top-level `;`, one per comma-separated item. `RUNNING(3)` yields
+/// `RUNNING`; the parenthesised constructor arguments are skipped. Returns
+/// `(char offset from `start`, name)` so the caller can recover line numbers.
+fn enum_enumerators(masked: &[char], start: usize, end: usize) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut item = start;
+    let mut i = start;
+    while i < end {
+        match masked[i] {
+            '(' | '<' | '[' | '{' => depth += 1,
+            ')' | '>' | ']' | '}' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            ';' if depth == 0 => {
+                if let Some(n) = leading_ident(&masked[item..i]) {
+                    out.push((item - start, n));
+                }
+                return out;
+            }
+            ',' if depth == 0 => {
+                if let Some(n) = leading_ident(&masked[item..i]) {
+                    out.push((item - start, n));
+                }
+                item = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(n) = leading_ident(&masked[item..i]) {
+        out.push((item - start, n));
+    }
+    out
+}
+
+fn leading_ident(seg: &[char]) -> Option<String> {
+    let mut i = 0;
+    while i < seg.len() && is_ws(seg[i]) {
+        i += 1;
+    }
+    if i >= seg.len() || !is_word_start(seg[i]) {
+        return None;
+    }
+    let s0 = i;
+    while i < seg.len() && is_word(seg[i]) {
+        i += 1;
+    }
+    Some(seg[s0..i].iter().collect())
+}
+
 /// `"=>"`, the expression-bodied member marker. Adjacent, not two characters
 /// that merely appear somewhere on the line.
 fn has_arrow(s: &[char]) -> bool {
@@ -354,7 +475,24 @@ pub fn parse_source(src: &[char]) -> Parsed {
             }
         };
 
-        let hit = m::match_header(&cand).or_else(|| m::match_csharp_header(&cand));
+        // An expression-bodied member (C#) has no brace: the `=>` line is the
+        // whole body, so match the declaration head as if a `{` closed it.
+        let expr_body = !cand.iter().any(|&c| c == '{');
+        let hit = if expr_body {
+            let arrow = cand
+                .windows(2)
+                .position(|w| w == ['=', '>'])
+                .unwrap_or(cand.len());
+            let mut head: Vec<char> = cand[..arrow].to_vec();
+            head.push('{');
+            m::match_header(&head)
+                .or_else(|| m::match_csharp_header(&head))
+                .or_else(|| m::match_wide_header(&head))
+        } else {
+            m::match_header(&cand)
+                .or_else(|| m::match_csharp_header(&cand))
+                .or_else(|| m::match_wide_header(&cand))
+        };
         let (name, params) = match hit {
             Some(v) => v,
             None => {
@@ -366,37 +504,45 @@ pub fn parse_source(src: &[char]) -> Parsed {
             li += 1;
             continue;
         }
-        if m::has_close_paren_semi(&cand) {
+        // A type declaration with a parenthesised primary constructor
+        // (`class Foo(...) {`) is a type, not a function.
+        if m::match_type(&cand).as_deref() == Some(name.as_str()) {
+            li += 1;
+            continue;
+        }
+        if !expr_body && m::has_close_paren_semi(&cand) {
             li += 1;
             continue;
         }
 
         // Body end: walk masked chars from the header's '{' to its match.
-        let (ba, bb) = lr[brace_line];
-        let mut depth = 0i32;
-        let mut end = li;
-        let mut nl = brace_line;
-        let rel = masked[ba..bb].iter().rposition(|&c| c == '{');
-        let start = match rel {
-            Some(r) => ba + r,
-            None => ba,
-        };
-        for &ch in &masked[start..] {
-            match ch {
-                '\n' => nl += 1,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = nl + 1;
-                        break;
+        let mut end = brace_line + 1;
+        if !expr_body {
+            let (ba, bb) = lr[brace_line];
+            let mut depth = 0i32;
+            let mut nl = brace_line;
+            let rel = masked[ba..bb].iter().rposition(|&c| c == '{');
+            let start = match rel {
+                Some(r) => ba + r,
+                None => ba,
+            };
+            for &ch in &masked[start..] {
+                match ch {
+                    '\n' => nl += 1,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = nl + 1;
+                            break;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        if end < li + 1 {
-            end = li + 1; // unbalanced tail: claim this line, never rewind
+            if end < li + 1 {
+                end = li + 1; // unbalanced tail: claim this line, never rewind
+            }
         }
         let mut sig_parts: Vec<String> = Vec::new();
         // rawLines are split on /\r?\n/, so a CRLF tree contributes no `\r` here
@@ -416,6 +562,9 @@ pub fn parse_source(src: &[char]) -> Parsed {
     // Member symbols: declarations outside any function body. Locals live inside
     // bodies, so "not inside one" separates members from noise.
     let mut fi = 0usize;
+    // Line ranges (1-based, inclusive) of each type's brace body, so a member
+    // with no access modifier can be told from a file-scope declaration.
+    let mut type_bodies: Vec<(usize, usize, String, &'static str)> = Vec::new();
     for li in 0..lr.len() {
         while fi < out.funcs.len() && out.funcs[fi].end < li + 1 {
             fi += 1;
@@ -436,18 +585,77 @@ pub fn parse_source(src: &[char]) -> Parsed {
             });
             continue;
         }
-        if let Some(n) = m::match_type(t) {
+        // An annotation may lead the declaration (`@interface Marker {`,
+        // `@Deprecated class X {`); the type matcher wants the bare keyword.
+        let bare = if t.first() == Some(&'@') { &t[1..] } else { t };
+        if let Some((kw, n)) = m::type_decl(bare) {
             out.syms.push(Sym {
                 kind: "type",
-                name: n,
+                name: n.clone(),
                 line: li + 1,
             });
+            if let Some((s, e)) = brace_body_range(&masked, &lr, li) {
+                // A Java `record` header declares its components as implicit fields.
+                if kw == "record" {
+                    for c in m::record_components(bare).unwrap_or_default() {
+                        out.syms.push(Sym {
+                            kind: "field",
+                            name: c,
+                            line: li + 1,
+                        });
+                    }
+                }
+                // Enumerators sit between the opening `{` and the first top-level `;`.
+                if kw == "enum" {
+                    let (ba, bb) = lr[s - 1];
+                    if let Some(open) = masked[ba..bb].iter().position(|&c| c == '{') {
+                        let body_a = ba + open + 1;
+                        let body_b = lr[e - 1].1;
+                        for (off, name) in enum_enumerators(&masked, body_a, body_b) {
+                            let line = s
+                                + masked[body_a..body_a + off]
+                                    .iter()
+                                    .filter(|&&c| c == '\n')
+                                    .count();
+                            out.syms.push(Sym { kind: "field", name, line });
+                        }
+                    }
+                }
+                type_bodies.push((s, e, n, kw));
+            }
             continue;
         }
         let mem = match m::match_member(t) {
             Some(n) => n,
-            None => continue,
+            None => {
+                // A bare `Type name;` inside a type body is a member too; at file
+                // scope the same shape is a global, which is deliberately not swept.
+                if enclosing_type(&type_bodies, li + 1).is_some() {
+                    if let Some(n) = m::match_bare_member(t) {
+                        out.syms.push(Sym {
+                            kind: "field",
+                            name: n,
+                            line: li + 1,
+                        });
+                    }
+                }
+                continue;
+            }
         };
+        // A Java record's compact constructor has no parameter list:
+        // `public Point { ... }`. That is the type's own name, not a field.
+        if t.last() == Some(&'{')
+            && !t.contains(&'(')
+            && enclosing_type(&type_bodies, li + 1)
+                .is_some_and(|(_, _, tn, tk)| *tk == "record" && *tn == mem)
+        {
+            out.syms.push(Sym {
+                kind: "method",
+                name: mem,
+                line: li + 1,
+            });
+            continue;
+        }
         // A property is a declaration followed by an accessor - `=>` on the same
         // line, or a lone Allman `{` and then `get`/`set`/`init`. A field has
         // `;` or `=` after the name and nothing else.

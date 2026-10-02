@@ -139,10 +139,12 @@ pub fn run() -> i32 {
     // `([^()]*)` in the tail pattern stops at the first paren, so a generic
     // parameter list like `List<T> list` is outside the pattern. Pinned because
     // it is a real coverage limit of the original, not an accident of this port.
-    // expression-bodied members are declarations, not brace-delimited functions
+    // An expression-bodied member carries real code: the `=> expr;` line is its
+    // body, so it is indexed as a function. The rewrite deliberately goes past
+    // the original here - dropping it loses reconstructible source.
     c.ok(
-        "cs: expression-body not a function",
-        !nm.iter().any(|n| n == "NoBrace"),
+        "cs: expression-body is a function",
+        nm.iter().any(|n| n == "NoBrace"),
     );
     c.ok(
         "cs: `class` not a function",
@@ -449,9 +451,13 @@ pub fn run() -> i32 {
     // --- call scanning: dedupe, self-exclusion, keyword exclusion, cap
     let body = "void a() {\n\tb();\n\tb();\n\tif (c) { }\n\ta();\n}\nvoid b() {}\n";
     let ch = chars(body);
-    // `void b() {}` is a declaration with no body: the tail pattern requires
-    // `{` at end of line, so it is deliberately not indexed as a function.
-    assert!(parse_source(&ch).funcs.iter().all(|f| f.name == "a"));
+    // `void b() {}` is a single-line body and is a function (the reference
+    // implementation dropped it). Both `a` and `b` are indexed declarations.
+    let fs = parse_source(&ch).funcs;
+    assert!(
+        fs.iter().any(|f| f.name == "a") && fs.iter().any(|f| f.name == "b"),
+        "{fs:?}"
+    );
     let masked = mask(&ch, true);
     let lr = {
         let mut v = vec![(0usize, 0usize)];

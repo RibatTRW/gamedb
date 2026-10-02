@@ -251,3 +251,206 @@ fn a_camel_case_name_slugifies_without_splitting_the_acronym() {
     assert_eq!(slug("HTTPClient"), "http-client");
     assert_eq!(slug("engine.audio"), "engine.audio");
 }
+
+// --- language coverage: the shapes decompilers actually emit for C, C++, C#,
+// Java. Each of these was a silent miss before the tolerant matcher existed.
+#[test]
+fn cpp_out_of_line_definitions_are_functions() {
+    let src = concat!(
+        "namespace Game {\n",
+        "class Player {\n",
+        "public:\n",
+        "    void Update(int dt);\n",
+        "    int GetHealth() const;\n",
+        "private:\n",
+        "    int health_;\n",
+        "};\n",
+        "void Player::Update(int dt) {\n",
+        "    health_ += dt;\n",
+        "}\n",
+        "int Player::GetHealth() const {\n",
+        "    return health_;\n",
+        "}\n",
+        "std::shared_ptr<Player> MakePlayer() {\n",
+        "    return nullptr;\n",
+        "}\n",
+        "}\n",
+    );
+    let p = parse_source(&chars(src));
+    let nm: Vec<&str> = p.funcs.iter().map(|f| f.name.as_str()).collect();
+    for want in ["Update", "GetHealth", "MakePlayer"] {
+        assert!(nm.contains(&want), "missing {want} in {nm:?}");
+    }
+    // `void Update(int dt);` is a declaration, not a second definition.
+    assert_eq!(nm.iter().filter(|n| **n == "Update").count(), 1);
+    let fields: Vec<&str> = p
+        .syms
+        .iter()
+        .filter(|s| s.kind == "field")
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(fields.contains(&"health_"), "fields: {fields:?}");
+}
+
+#[test]
+fn a_java_throws_clause_does_not_hide_the_method() {
+    let src = concat!(
+        "public class Player {\n",
+        "    @Override\n",
+        "    public void update(int dt) throws IllegalStateException {\n",
+        "        this.health += dt;\n",
+        "    }\n",
+        "}\n",
+    );
+    let nm = names(src);
+    assert!(nm.iter().any(|n| n == "update"), "{nm:?}");
+}
+
+#[test]
+fn a_c_struct_body_yields_its_fields() {
+    let src = concat!(
+        "typedef struct SavedEntity {\n",
+        "    int id;\n",
+        "    char name[32];\n",
+        "    SavedEntity *next;\n",
+        "} SavedEntity;\n",
+    );
+    let p = parse_source(&chars(src));
+    let fields: Vec<&str> = p
+        .syms
+        .iter()
+        .filter(|s| s.kind == "field")
+        .map(|s| s.name.as_str())
+        .collect();
+    for want in ["id", "name", "next"] {
+        assert!(fields.contains(&want), "missing {want} in {fields:?}");
+    }
+}
+
+#[test]
+fn an_expression_body_is_the_function_body() {
+    let src = concat!(
+        "public class Player {\n",
+        "    private int health;\n",
+        "    public int TakeDamage(int amount) => this.health -= amount;\n",
+        "}\n",
+    );
+    let p = parse_source(&chars(src));
+    let f = p
+        .funcs
+        .iter()
+        .find(|f| f.name == "TakeDamage")
+        .expect("TakeDamage");
+    assert_eq!(f.start, 3);
+    assert_eq!(f.end, 3);
+}
+
+#[test]
+fn statement_keywords_and_primary_constructors_are_not_functions() {
+    let src = concat!(
+        "fun main() {\n",
+        "    if (ready) {\n",
+        "        when (state) {\n",
+        "            else -> go();\n",
+        "        }\n",
+        "    }\n",
+        "}\n",
+        "class Player(private var health: Int) {\n",
+        "    fun update(dt: Int) {\n",
+        "        health += dt\n",
+        "    }\n",
+        "}\n",
+    );
+    let nm = names(src);
+    assert!(
+        !nm.iter().any(|n| n == "if" || n == "when"),
+        "control keyword became a function: {nm:?}"
+    );
+    assert!(
+        !nm.iter().any(|n| n == "Player"),
+        "a primary constructor is a type, not a function: {nm:?}"
+    );
+    assert!(nm.iter().any(|n| n == "update"), "{nm:?}");
+}
+
+// --- Java parity: the four shapes C/C++/C# already cover, plus the two
+// Java-only member sources (record components, enum constants).
+fn fields_of(s: &str) -> Vec<String> {
+    parse_source(&chars(s))
+        .syms
+        .iter()
+        .filter(|x| x.kind == "field")
+        .map(|x| x.name.clone())
+        .collect()
+}
+
+#[test]
+fn a_single_line_body_is_a_function() {
+    let src = concat!(
+        "public class P {\n",
+        "    public int getHealth() { return this.health; }\n",
+        "    public void setHealth(int h) { this.health = h; }\n",
+        "}\n",
+    );
+    let nm = names(src);
+    assert!(nm.iter().any(|n| n == "getHealth"), "{nm:?}");
+    assert!(nm.iter().any(|n| n == "setHealth"), "{nm:?}");
+}
+
+#[test]
+fn java_enum_constants_are_fields() {
+    let src = concat!(
+        "enum State {\n",
+        "    IDLE, RUNNING(3), DEAD;\n",
+        "    private final int speed;\n",
+        "    State(int s) { this.speed = s; }\n",
+        "}\n",
+    );
+    let f = fields_of(src);
+    for want in ["IDLE", "RUNNING", "DEAD", "speed"] {
+        assert!(f.contains(&want.to_string()), "missing {want} in {f:?}");
+    }
+}
+
+#[test]
+fn java_record_components_are_fields() {
+    let src = concat!(
+        "record Point(int x, int y) {\n",
+        "    public int sum() { return x + y; }\n",
+        "}\n",
+    );
+    let f = fields_of(src);
+    for want in ["x", "y"] {
+        assert!(f.contains(&want.to_string()), "missing {want} in {f:?}");
+    }
+}
+
+#[test]
+fn a_record_compact_constructor_is_not_a_field() {
+    let src = concat!(
+        "record Point(int x, int y) {\n",
+        "    public Point {\n",
+        "        if (x < 0) { throw new IllegalArgumentException(\"x\"); }\n",
+        "    }\n",
+        "}\n",
+    );
+    let p = parse_source(&chars(src));
+    let fields: Vec<&str> = p
+        .syms
+        .iter()
+        .filter(|s| s.kind == "field")
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["x", "y"],
+        "a compact constructor must not masquerade as a field: {fields:?}"
+    );
+    assert!(
+        p.syms
+            .iter()
+            .any(|s| s.kind == "method" && s.name == "Point"),
+        "the compact constructor should still be recorded: {:?}",
+        p.syms
+    );
+}

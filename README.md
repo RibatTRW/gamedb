@@ -179,11 +179,18 @@ previous sign-off rather than wiping it.
 
 Brace-delimited source, which is what decompiler output is:
 
-- C, C++ (Ghidra and friends)
-- Java (Ghidra, JADX, CFR)
-- C# (ILSpy, dnSpy)
-- Go, Rust, Swift, Kotlin, Scala, Dart, PHP
-- JavaScript, TypeScript, JSX, TSX
+- **C, C++** (Ghidra and friends), **C#** (ILSpy, dnSpy), **Java** (JADX, CFR) — the
+  four target languages, read by the heuristic matcher in `src/rx.rs`.
+- Go, Rust, Swift, Kotlin, Scala, Dart, PHP, JavaScript/TypeScript — read
+  *heuristically*: plain declarations index, but receivers, arrow functions, and
+  return-typed signatures are not faithfully recovered. These need a real
+  grammar; see [`docs/language-mockups.md`](docs/language-mockups.md).
+
+Outstanding per-language work is tracked in [`ENHANCEMENTS.md`](ENHANCEMENTS.md),
+ordered most common language first.
+
+[`docs/language-support.md`](docs/language-support.md) has the measured verdict per
+language and the honest limits of a brace scanner.
 
 Also read, because decompilers emit them alongside code: `.txt` header dumps and `.asm`
 disassembly listings. `SRC_EXT` in `src/store.rs` is the authoritative list.
@@ -200,11 +207,17 @@ void f(                                // parameters wrapped across lines
     char *out,
     int n)
 { ... }
+void Player::Update(int dt) { ... }    // qualified owner: name is the final segment
+int GetHealth() const { ... }          // trailing qualifiers after `)`
+public void update() throws E { ... }  // throws / where clauses after `)`
+std::shared_ptr<Player> Make() { ... } // namespace-qualified return type
+int id;                                // C struct field (no access modifier)
+int X => Y;                            // expression body: one-line function
 ```
 
-Declarations must be brace-delimited. `int x = f();` on one line with no `{}` body is a
-declaration, not a function, and is deliberately not indexed. Expression-bodied members
-(`int X => Y;`) are declarations too, for the same reason.
+Declarations must be brace-delimited, except expression bodies (`int X => Y;`), which
+are indexed with their `=>` line as the body. `int x = f();` on one line with no `{}`
+body is a declaration, not a function, and is deliberately not indexed.
 
 ## What is in the index
 

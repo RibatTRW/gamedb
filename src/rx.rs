@@ -226,6 +226,318 @@ pub fn match_csharp_header(s: &[char]) -> Option<(String, String)> {
     }
 }
 
+/// A name that may be scope-qualified (`A::B::name`) or carry a template
+/// argument list on the final segment. Returns the final segment and the index
+/// just past it, so `Game::Core::Player::Update` yields `Update`.
+fn qualified_name(s: &[char], i: usize) -> Option<(String, usize)> {
+    let (mut name, mut j) = read_word(s, i)?;
+    loop {
+        let k = skip_ws(s, j);
+        if k + 1 < s.len() && s[k] == ':' && s[k + 1] == ':' {
+            let m = skip_ws(s, k + 2);
+            match read_word(s, m) {
+                Some((w, j2)) => {
+                    name = w;
+                    j = j2;
+                }
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
+    Some((name, j))
+}
+
+/// Index just past the `>` that balances the `<` at `open`, counting nesting so
+/// `Map<String, List<int>>` closes on the right one.
+fn skip_angle(s: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < s.len() {
+        match s[i] {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The identifier ending immediately before `i` (skipping whitespace).
+fn prev_word(s: &[char], i: usize) -> Option<String> {
+    let mut j = i;
+    while j > 0 && is_ws(s[j - 1]) {
+        j -= 1;
+    }
+    let mut a = j;
+    while a > 0 && is_word(s[a - 1]) {
+        a -= 1;
+    }
+    (a < j).then(|| s[a..j].iter().collect())
+}
+
+/// A word that owns the parenthesised text after it: a statement keyword, an
+/// operator, or a type-declaration keyword. `if constexpr (x) {` must not read
+/// as a function called `constexpr`, and `class Foo(...) {` is a type, not a
+/// constructor definition.
+fn is_blocking_prefix(w: &str) -> bool {
+    matches!(
+        w,
+        "if" | "while"
+            | "for"
+            | "switch"
+            | "catch"
+            | "return"
+            | "else"
+            | "case"
+            | "do"
+            | "new"
+            | "throw"
+            | "throws"
+            | "using"
+            | "lock"
+            | "assert"
+            | "sizeof"
+            | "decltype"
+            | "alignof"
+            | "typeid"
+            | "noexcept"
+            | "static_assert"
+            | "when"
+            | "yield"
+            | "await"
+            | "select"
+            | "class"
+            | "struct"
+            | "interface"
+            | "record"
+            | "enum"
+            | "delegate"
+            | "object"
+            | "impl"
+            | "trait"
+            | "namespace"
+            | "union"
+            | "template"
+    )
+}
+
+/// Everything that may legally sit between a definition's `)` and its `{`:
+/// trailing qualifiers (`const`, `override`, `final`, `noexcept`, `volatile`),
+/// a `throws`/`where` clause, a trailing return type (`-> T`), a constructor
+/// init-list, and balanced parentheses inside any of those. Anything else
+/// (`;`, `=`, an unbalanced `)`/`}`) ends the scan with `None`.
+fn wide_gap(s: &[char], mut i: usize) -> Option<usize> {
+    loop {
+        i = skip_ws(s, i);
+        if i >= s.len() {
+            return None;
+        }
+        match s[i] {
+            '{' => return Some(i),
+            '(' => i = close_paren(s, i)?.0 + 1,
+            ')' | '}' | ';' | '=' => return None,
+            '-' => {
+                if i + 1 < s.len() && s[i + 1] == '>' {
+                    i += 2;
+                } else {
+                    return None;
+                }
+            }
+            ':' | '&' | '*' | '<' | '>' | ',' | '.' | '?' | '~' | '[' | ']' | '@' => i += 1,
+            c if is_word(c) => {
+                let (_, j) = read_word(s, i)?;
+                i = j;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// `WIDE_HEADER`: the tolerant sibling of `match_header`/`match_csharp_header`.
+/// It accepts what a decompiler actually emits for C++ and Java - scope-qualified
+/// names (`A::B::f`), namespaced return types (`std::string f`), trailing
+/// qualifiers (`const`, `override`, `noexcept`), `throws`/`where` clauses,
+/// trailing return types, and constructor init-lists - while still refusing
+/// statement keywords and non-definition shapes.
+///
+/// A candidate is tried at the start of the line, after whitespace, and after a
+/// qualified-name/parenthesis boundary (`*`, `&`, `>`, `]`, `:`); the strict
+/// matchers run first, so this only ever *adds* definitions.
+fn wide_tail(s: &[char], i: usize) -> Option<(String, String)> {
+    if is_blocking_prefix(&prev_word(s, i).unwrap_or_default()) {
+        return None;
+    }
+    let (name, j) = qualified_name(s, i)?;
+    let mut k = skip_ws(s, j);
+    if k < s.len() && s[k] == '<' {
+        k = skip_angle(s, k)?;
+        k = skip_ws(s, k);
+    }
+    if k >= s.len() || s[k] != '(' {
+        return None;
+    }
+    let (pe, params) = close_paren(s, k)?;
+    let brace = wide_gap(s, pe + 1)?;
+    if !at_end(s, brace + 1) {
+        return None;
+    }
+    Some((name, collapse_ws(&params)))
+}
+
+pub fn match_wide_header(s: &[char]) -> Option<(String, String)> {
+    let i0 = skip_ws(s, 0);
+    let mut i = i0;
+    loop {
+        if i >= s.len() {
+            return None;
+        }
+        let candidate =
+            i == i0 || is_ws(s[i - 1]) || matches!(s[i - 1], '*' | '&' | '>' | ']' | ':');
+        if candidate {
+            if let Some(hit) = wide_tail(s, i) {
+                return Some(hit);
+            }
+        }
+        if is_tok(s[i]) || matches!(s[i], ':' | '@' | '~') {
+            i += 1;
+        } else if is_ws(s[i]) {
+            i = skip_ws(s, i);
+        } else {
+            return None;
+        }
+    }
+}
+
+/// `BARE_MEMBER`: a member with no access modifier - the shape a C `struct`,
+/// a C++ class at its default access level, or a language without visibility
+/// keywords uses. `Type name;`, `Type *name;`, `Type name[8];`, `Type name = 0;`.
+/// Only called for lines known to sit inside a type body, so file-scope globals
+/// are not swept in.
+pub fn match_bare_member(s: &[char]) -> Option<String> {
+    let semi = s.iter().position(|&c| c == ';')?;
+    let mut end = semi;
+    if let Some(eq) = s[..end].iter().position(|&c| c == '=') {
+        end = eq;
+    }
+    // drop trailing array extents: `name[8]`, `name[8][4]`
+    loop {
+        let mut i = end;
+        while i > 0 && is_ws(s[i - 1]) {
+            i -= 1;
+        }
+        if i > 0 && s[i - 1] == ']' {
+            let mut d = 0i32;
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                match s[j] {
+                    ']' => d += 1,
+                    '[' => {
+                        d -= 1;
+                        if d == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if d != 0 {
+                return None;
+            }
+            end = j;
+        } else {
+            break;
+        }
+    }
+    let body = &s[..end];
+    if body
+        .iter()
+        .any(|&c| matches!(c, '(' | ')' | '{' | '}' | '"' | '\''))
+    {
+        return None;
+    }
+    // a lone `:` is a label or a bitfield; `::` is a scope qualifier
+    let mut ci = 0;
+    while ci < body.len() {
+        if body[ci] == ':' {
+            if ci + 1 < body.len() && body[ci + 1] == ':' {
+                ci += 2;
+                continue;
+            }
+            return None;
+        }
+        ci += 1;
+    }
+    // the last identifier is the member name
+    let mut j = body.len();
+    while j > 0 && is_ws(body[j - 1]) {
+        j -= 1;
+    }
+    let name_end = j;
+    while j > 0 && is_word(body[j - 1]) {
+        j -= 1;
+    }
+    if j == name_end {
+        return None;
+    }
+    // a type must precede it, past any pointer/reference/template punctuation
+    let mut k = j;
+    while k > 0 && (is_ws(body[k - 1]) || matches!(body[k - 1], '*' | '&' | '>' | ']')) {
+        k -= 1;
+    }
+    let mut t = k;
+    while t > 0 && is_word(body[t - 1]) {
+        t -= 1;
+    }
+    if t == k {
+        return None;
+    }
+    let name: String = body[j..name_end].iter().collect();
+    if matches!(
+        name.as_str(),
+        "return"
+            | "using"
+            | "typedef"
+            | "import"
+            | "package"
+            | "class"
+            | "struct"
+            | "union"
+            | "enum"
+            | "namespace"
+            | "template"
+            | "friend"
+            | "public"
+            | "private"
+            | "protected"
+            | "static"
+            | "const"
+            | "unsigned"
+            | "signed"
+            | "long"
+            | "short"
+            | "void"
+            | "int"
+            | "char"
+            | "float"
+            | "double"
+            | "bool"
+            | "auto"
+            | "var"
+    ) {
+        return None;
+    }
+    Some(name)
+}
+
 /// `namespace\s+([\w.]+)` — greedy through dots, so `A.B.C` is one name.
 pub fn match_namespace(s: &[char]) -> Option<String> {
     const KW: &str = "namespace";
@@ -255,6 +567,13 @@ pub fn match_namespace(s: &[char]) -> Option<String> {
 /// token+whitespace run at position 0 wins; a keyword further along the line
 /// (after a `(` or `;`) is not a declaration.
 pub fn match_type(s: &[char]) -> Option<String> {
+    type_decl(s).map(|(_, n)| n)
+}
+
+/// `(keyword, name)` for a type declaration, so a caller can tell a `record`
+/// (whose header components are implicit fields) from a plain `class` before
+/// deciding what else the header declares.
+pub fn type_decl(s: &[char]) -> Option<(&'static str, String)> {
     const KWS: [&str; 6] = ["class", "struct", "interface", "enum", "record", "delegate"];
     let mut ends: Vec<usize> = vec![0]; // zero repetitions is the last fallback
     let mut i = 0;
@@ -280,13 +599,90 @@ pub fn match_type(s: &[char]) -> Option<String> {
                 let j = skip_ws(s, p + k.len());
                 if j > p + k.len() && j < s.len() && is_word_start(s[j]) {
                     if let Some((n, _)) = read_word(s, j) {
-                        return Some(n);
+                        return Some((kw, n));
                     }
                 }
             }
         }
     }
     None
+}
+
+/// Java `record`: the parenthesised header components are implicitly declared
+/// `private final` fields, so they belong in `symbols` alongside ordinary ones.
+/// `record Point(int x, int y)` yields `["x", "y"]`.
+pub fn record_components(s: &[char]) -> Option<Vec<String>> {
+    let (kw, name) = type_decl(s)?;
+    if kw != "record" {
+        return None;
+    }
+    let mut i = 0;
+    while i < s.len() {
+        if is_word_start(s[i]) && (i == 0 || !is_word(s[i - 1])) {
+            let (w, j) = read_word(s, i)?;
+            if w == name {
+                let mut k = skip_ws(s, j);
+                if k < s.len() && s[k] == '<' {
+                    k = skip_angle(s, k)?;
+                    k = skip_ws(s, k);
+                }
+                if k >= s.len() || s[k] != '(' {
+                    return None;
+                }
+                let (_, params) = close_paren(s, k)?;
+                return Some(component_names(&params));
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The last identifier of each top-level comma-separated parameter: for
+/// `@NotNull String name, List<Integer> tags` that is `["name", "tags"]`.
+fn component_names(params: &str) -> Vec<String> {
+    let params: Vec<char> = params.chars().collect();
+    let params = &params[..];
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= params.len() {
+        let at_end = i == params.len();
+        if !at_end {
+            match params[i] {
+                '(' | '<' | '[' => depth += 1,
+                ')' | '>' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+        if (at_end || params[i] == ',') && depth == 0 {
+            if let Some(n) = last_ident(&params[start..i]) {
+                out.push(n);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn last_ident(part: &[char]) -> Option<String> {
+    let mut end = part.len();
+    while end > 0 && is_ws(part[end - 1]) {
+        end -= 1;
+    }
+    let mut j = end;
+    while j > 0 && !is_word(part[j - 1]) {
+        j -= 1;
+    }
+    let stop = j;
+    while j > 0 && is_word(part[j - 1]) {
+        j -= 1;
+    }
+    (stop > j).then(|| part[j..stop].iter().collect())
 }
 
 const MODIFIERS: [&str; 20] = [
