@@ -9,6 +9,16 @@ description: Navigate a decompiled source tree (Ghidra/IDA C or C++, ILSpy/dnSpy
 
 Every command takes `-r SRC` (default `.`). Pass the same `-r` (and `--db PATH`, if you used one) on every call: the index is found through them.
 
+## Start here
+
+The user may invoke this skill with a question attached (for example `/gamedb-cli who calls PlayerUpdate`). Do the setup yourself, then answer:
+
+1. **Root.** Use the folder the user names; otherwise the current project root. Never guess a root from folder or file names.
+2. **Binary.** If `gamedb` is not on `PATH`, stop and tell the user how to build it: from a gamedb checkout, `cargo build --release`, then put `target/release/gamedb` on `PATH`. Do not run the build unless they ask.
+3. **Index.** Run `gamedb index -r ROOT` before the first query. It is incremental, so it is always safe, and it refreshes a stale index.
+4. **Check.** Run `gamedb stats -r ROOT`. If `files` or `functions` is zero or near zero, the root is wrong; queries against it return empty output with exit `0`, not an error. Decompiler output under a skipped directory (`build`, `bin`, `obj`, `dist`, ...) is a common cause: if the code's location is obvious, re-run with `-r` pointing inside that directory. Otherwise ask the user where the code is rather than answering from an empty index.
+5. **Answer** the question with the workflow below.
+
 ## Workflow
 
 1. **Index.** `gamedb index -r SRC`. Re-run it whenever source has changed since the last run: it is incremental (unchanged files skipped by mtime + size, deleted files dropped), so a no-op run costs milliseconds. The first line is `indexed files=N ...`, where `files`/`fn`/`str`/... count only files re-parsed *this run*; use `gamedb stats -r SRC` for index totals. Read every line after the first:
